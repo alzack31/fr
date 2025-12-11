@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Real-time Face Recognition</title>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js"></script>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+      min-height:100vh; display:flex; flex-direction:column; align-items:center;
+      padding:20px; color:#fff;
+    }
+    h1 { margin:20px 0; font-size:2.2em; text-shadow:2px 2px 4px rgba(0,0,0,.3); }
+    .container {
+      background: rgba(255,255,255,0.08); backdrop-filter: blur(8px);
+      border-radius:16px; padding:22px; box-shadow:0 8px 32px rgba(0,0,0,0.25);
+      max-width:960px; width:100%;
+    }
+    .status { background: rgba(255,255,255,0.09); padding:12px; border-radius:10px; margin-bottom:14px; text-align:center; font-size:1em; }
+    .status.loading { background: rgba(255,193,7,0.25); }
+    .status.ready { background: rgba(76,175,80,0.25); }
+    .status.error { background: rgba(244,67,54,0.25); }
+    .camera-select { background: rgba(255,255,255,0.06); padding:16px; border-radius:10px; margin-bottom:14px; }
+    .camera-select label { display:block; margin-bottom:8px; font-weight:700; }
+    .camera-select select { width:100%; padding:10px; border-radius:8px; border:none; background:#fff; color:#222; font-size:1em; cursor:pointer; }
+    .controls { display:flex; gap:12px; justify-content:center; margin-top:10px; flex-wrap:wrap; }
+    button {
+      background: rgba(255,255,255,0.18); border:2px solid rgba(255,255,255,0.35);
+      color:#fff; padding:10px 20px; border-radius:20px; cursor:pointer; font-weight:700;
+      transition: all .22s; text-transform:uppercase;
+    }
+    button:hover { transform:translateY(-3px); background: rgba(255,255,255,0.32); }
+    button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
+    .video-container { position:relative; display:inline-block; margin:18px auto; text-align:center; }
+    video { border-radius:12px; max-width:100%; display:block; box-shadow:0 6px 26px rgba(0,0,0,.35); }
+    canvas { position:absolute; top:0; left:0; border-radius:12px; pointer-events:none; }
+    .recognition-result {
+      background: rgba(76,175,80,0.35); padding:12px; border-radius:10px; margin-top:14px; text-align:center; font-weight:700;
+      min-height:48px; display:flex; align-items:center; justify-content:center;
+    }
+    .persons-loaded { background: rgba(255,255,255,0.06); padding:12px; border-radius:10px; margin-top:12px; font-size:.98em; }
+    .persons-loaded h3 { margin-bottom:8px; font-size:1.05em; }
+    .person-tag { display:inline-block; background: rgba(255,255,255,0.14); padding:6px 12px; border-radius:14px; margin:6px; font-size:.92em; color:#fff; }
+    .small { font-size:.9em; opacity:.9; }
+  </style>
+</head>
+<body>
+  <h1>🎭 Real-time Face Recognition</h1>
+
+  <div class="container">
+    <div id="status" class="status loading">Loading models...</div>
+
+    <div class="camera-select">
+      <label for="cameraSelect">📷 Select Camera:</label>
+      <select id="cameraSelect" disabled>
+        <option value="">Loading cameras...</option>
+      </select>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn" disabled>Start Camera</button>
+      <button id="stopBtn" disabled>Stop Camera</button>
+      <button id="reloadBtn">Reload Database</button>
+    </div>
+
+    <div class="video-container" style="margin-top:16px;">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <div id="result" class="recognition-result">Waiting to start...</div>
+
+    <div id="personsLoaded" class="persons-loaded" style="display:none;">
+      <h3>👥 Loaded Persons:</h3>
+      <div id="personsList"></div>
+      <div class="small" style="margin-top:8px;">(Names discovered from <code>/database/</code> directory listing.)</div>
+    </div>
+  </div>
+
+  <script>
+    // Core state
+    let labeledDescriptors = [];
+    let faceMatcher = null;
+    let video = null, canvas = null, ctx = null;
+    let isVideoRunning = false;
+    let currentStream = null;
+    let detectionRaf = null;
+    let lastDetectionTime = 0;
+    const DETECTION_THROTTLE_MS = 100; // min time between detections
+
+    // On load
+    window.addEventListener('load', async () => {
+      video = document.getElementById('video');
+      canvas = document.getElementById('canvas');
+      ctx = canvas.getContext('2d');
+
+      // wire up buttons
+      document.getElementById('startBtn').addEventListener('click', startVideo);
+      document.getElementById('stopBtn').addEventListener('click', stopVideo);
+      document.getElementById('reloadBtn').addEventListener('click', async () => {
+        document.getElementById('reloadBtn').disabled = true;
+        document.getElementById('reloadBtn').textContent = 'Reloading...';
+        await loadTrainingData();
+        document.getElementById('reloadBtn').disabled = false;
+        document.getElementById('reloadBtn').textContent = 'Reload Database';
+      });
+
+      await loadModels();
+      await warmupCameraPermission(); // so enumerateDevices returns labels
+      await loadCameras();
+      await loadTrainingData();
+    });
+
+    // Load face-api models
+    async function loadModels() {
+      const status = document.getElementById('status');
+      try {
+        status.textContent = 'Loading face detection models...';
+        const MODEL_URL = 'https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/weights';
+        await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+        await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+        await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+        status.textContent = '✅ Models loaded successfully!';
+        status.className = 'status ready';
+      } catch (e) {
+        status.textContent = '❌ Error loading models: ' + (e.message || e);
+        status.className = 'status error';
+        console.error(e);
+      }
+    }
+
+    // Warmup permission to reveal camera labels
+    async function warmupCameraPermission() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        stream.getTracks().forEach(t => t.stop());
+      } catch (e) {
+        // user may deny — that's fine, device labels will be generic
+        console.warn('camera warmup failed:', e);
+      }
+    }
+
+    // Populate camera select
+    async function loadCameras() {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+        const cameraSelect = document.getElementById('cameraSelect');
+        cameraSelect.innerHTML = '';
+
+        if (videoDevices.length === 0) {
+          cameraSelect.innerHTML = '<option value="">No cameras found</option>';
+          cameraSelect.disabled = true;
+          return;
+        }
+
+        videoDevices.forEach((device, idx) => {
+          const opt = document.createElement('option');
+          opt.value = device.deviceId;
+          opt.textContent = device.label || `Camera ${idx+1}`;
+          cameraSelect.appendChild(opt);
+        });
+
+        cameraSelect.disabled = false;
+        cameraSelect.addEventListener('change', () => {
+          if (isVideoRunning) {
+            stopVideo();
+            setTimeout(() => startVideo(), 250);
+          }
+        });
+      } catch (e) {
+        console.error('Error enumerating devices:', e);
+        document.getElementById('cameraSelect').innerHTML = '<option value="">Error loading cameras</option>';
+      }
+    }
+
+    // Scan database folders from directory listing
+    async function scanDatabaseFolders() {
+      const baseUrl = 'database/';
+      try {
+        const resp = await fetch(baseUrl, { method: 'GET' });
+        if (resp.ok) {
+          const ct = (resp.headers.get('content-type') || '').toLowerCase();
+          if (ct.includes('text/html')) {
+            const html = await resp.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const anchors = Array.from(doc.querySelectorAll('a[href]'));
+            const folders = anchors
+              .map(a => a.getAttribute('href'))
+              .filter(href => href && href !== '../')
+              .map(h => {
+                // normalize: may be 'person1/' or './person1/' or full path
+                let v = h.replace(/^\.\//,'').replace(/\/$/,'');
+                // strip query or hash if present
+                v = v.split('?')[0].split('#')[0];
+                return v;
+              })
+              .filter((v,i,a) => v && a.indexOf(v) === i)
+              .filter(v => {
+                // Heuristic: ignore items that look like files (contain a dot)
+                return !v.includes('.');
+              });
+
+            if (folders.length > 0) {
+              console.log('Discovered folders from directory listing:', folders);
+              return folders;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Directory listing parse failed (or not provided):', e);
+      }
+
+      // No fallback - return empty array
+      console.warn('No directory listing available. Please ensure your server provides directory listing for /database/');
+      return [];
+    }
+
+    // Load training images from discovered folders
+    async function loadTrainingData() {
+      const status = document.getElementById('status');
+      try {
+        status.textContent = 'Scanning database for persons...';
+        status.className = 'status loading';
+        labeledDescriptors = [];
+
+        const persons = await scanDatabaseFolders();
+
+        if (!persons || persons.length === 0) {
+          status.textContent = '⚠️ No persons found. Ensure server has directory listing enabled for /database/';
+          status.className = 'status error';
+          document.getElementById('startBtn').disabled = true;
+          return;
+        }
+
+        status.textContent = `Found ${persons.length} persons. Loading images...`;
+
+        for (const person of persons) {
+          const descriptors = [];
+          const extensions = ['jpg','jpeg','png'];
+          // try up to 20 images per folder
+          for (let i=1;i<=20;i++){
+            let got = false;
+            for (const ext of extensions) {
+              const imageUrl = `database/${person}/image${i}.${ext}`;
+              try {
+                const img = await faceapi.fetchImage(imageUrl);
+                const detection = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
+                if (detection && detection.descriptor) {
+                  descriptors.push(detection.descriptor);
+                  got = true;
+                  console.log(`Loaded ${person}/image${i}.${ext}`);
+                  break;
+                }
+              } catch (e) {
+                // image may not exist; try next extension
+              }
+            }
+            // stop if no image found for this i (and i>1)
+            if (!got && i>1) break;
+          }
+          if (descriptors.length > 0) {
+            labeledDescriptors.push(new faceapi.LabeledFaceDescriptors(person, descriptors));
+          }
+        }
+
+        if (labeledDescriptors.length === 0) {
+          status.textContent = '⚠️ No valid training images found.';
+          status.className = 'status error';
+          document.getElementById('startBtn').disabled = true;
+          return;
+        }
+
+        // create faceMatcher once
+        faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
+        displayLoadedPersons();
+
+        status.textContent = `✅ Loaded ${labeledDescriptors.length} persons. Select camera and start!`;
+        status.className = 'status ready';
+        document.getElementById('startBtn').disabled = false;
+      } catch (e) {
+        console.error('Error loading training data:', e);
+        status.textContent = '❌ Error loading training data: ' + (e.message || e);
+        status.className = 'status error';
+      }
+    }
+
+    function displayLoadedPersons() {
+      const personsLoadedDiv = document.getElementById('personsLoaded');
+      const personsList = document.getElementById('personsList');
+      personsList.innerHTML = '';
+      labeledDescriptors.forEach(d => {
+        const tag = document.createElement('span');
+        tag.className = 'person-tag';
+        tag.textContent = `${d.label} (${d.descriptors.length} images)`;
+        personsList.appendChild(tag);
+      });
+      personsLoadedDiv.style.display = 'block';
+    }
+
+    // Start camera and detection
+    async function startVideo() {
+      try {
+        if (currentStream) {
+          currentStream.getTracks().forEach(t => t.stop());
+        }
+
+        const cameraSelect = document.getElementById('cameraSelect');
+        const selected = cameraSelect.value;
+        const constraints = {
+          video: {
+            deviceId: selected ? { exact: selected } : undefined,
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: 'user'
+          }
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        currentStream = stream;
+        video.srcObject = stream;
+        isVideoRunning = true;
+
+        await new Promise(resolve => {
+          video.onloadedmetadata = () => {
+            canvas.width = video.videoWidth || 640;
+            canvas.height = video.videoHeight || 480;
+            resolve();
+          };
+        });
+
+        document.getElementById('startBtn').disabled = true;
+        document.getElementById('stopBtn').disabled = false;
+        document.getElementById('result').textContent = 'Camera started. Looking for faces...';
+
+        if (!detectionRaf) detectionLoop();
+      } catch (e) {
+        alert('Error accessing camera: ' + (e.message || e));
+        console.error(e);
+      }
+    }
+
+    function stopVideo() {
+      if (currentStream) {
+        currentStream.getTracks().forEach(t => t.stop());
+        currentStream = null;
+      }
+      if (detectionRaf) {
+        cancelAnimationFrame(detectionRaf);
+        detectionRaf = null;
+      }
+      isVideoRunning = false;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
+      document.getElementById('result').textContent = 'Camera stopped.';
+    }
+
+    // main loop using requestAnimationFrame and throttling
+    async function detectionLoop() {
+      detectionRaf = requestAnimationFrame(detectionLoop);
+      if (!isVideoRunning || !faceMatcher) return;
+
+      const now = performance.now();
+      if (now - lastDetectionTime < DETECTION_THROTTLE_MS) return;
+      lastDetectionTime = now;
+
+      try {
+        const detections = await faceapi.detectAllFaces(video).withFaceLandmarks().withFaceDescriptors();
+        // resize results to displayed size
+        const displaySize = { width: video.videoWidth, height: video.videoHeight };
+        const resized = faceapi.resizeResults(detections, displaySize);
+
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+
+        if (resized.length > 0) {
+          const results = resized.map(d => faceMatcher.findBestMatch(d.descriptor));
+          resized.forEach((detection, i) => {
+            const box = detection.detection.box;
+            const match = results[i];
+            // draw box
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#00ff00';
+            ctx.strokeRect(box.x, box.y, box.width, box.height);
+            // label background
+            const text = match.toString();
+            const th = 22;
+            ctx.fillStyle = 'rgba(0,255,0,0.85)';
+            ctx.fillRect(box.x, Math.max(0, box.y - th), box.width, th);
+            // label text
+            ctx.fillStyle = '#000';
+            ctx.font = '18px Arial';
+            ctx.fillText(text, box.x + 6, Math.max(14, box.y - 6));
+          });
+
+          const recognizedNames = results
+            .filter(r => r.label !== 'unknown')
+            .map(r => r.label)
+            .filter((v,i,a)=>a.indexOf(v)===i)
+            .join(', ');
+
+          if (recognizedNames) {
+            document.getElementById('result').textContent = `✅ Recognized: ${recognizedNames}`;
+          } else {
+            document.getElementById('result').textContent = '❓ Unknown person detected';
+          }
+        } else {
+          document.getElementById('result').textContent = '🔍 No faces detected';
+        }
+      } catch (e) {
+        console.error('Detection error:', e);
+      }
+    }
+
+    // Stop detection when tab hidden to save CPU
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (detectionRaf) cancelAnimationFrame(detectionRaf);
+        detectionRaf = null;
+      } else {
+        if (isVideoRunning && !detectionRaf) detectionLoop();
+      }
+    });
+
+    // Resize canvas if window resized (keeps alignment)
+    window.addEventListener('resize', () => {
+      if (video && video.videoWidth) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+    });
+  </script>
+</body>
+</html>
