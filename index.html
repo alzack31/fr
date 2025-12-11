@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Real-time Face Recognition</title>
-  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js"></script>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
     body {
@@ -45,6 +45,16 @@
     .persons-loaded h3 { margin-bottom:8px; font-size:1.05em; }
     .person-tag { display:inline-block; background: rgba(255,255,255,0.14); padding:6px 12px; border-radius:14px; margin:6px; font-size:.92em; color:#fff; }
     .small { font-size:.9em; opacity:.9; }
+    .config-section { background: rgba(255,255,255,0.06); padding:16px; border-radius:10px; margin-bottom:14px; }
+    .config-section h3 { margin-bottom:10px; font-size:1.1em; }
+    .config-section textarea {
+      width:100%; min-height:80px; padding:10px; border-radius:8px; border:none;
+      background:rgba(255,255,255,0.9); color:#222; font-family:monospace; font-size:0.9em;
+      resize:vertical;
+    }
+    .config-section .help {
+      margin-top:8px; font-size:0.85em; opacity:0.85; line-height:1.4;
+    }
   </style>
 </head>
 <body>
@@ -52,6 +62,15 @@
 
   <div class="container">
     <div id="status" class="status loading">Loading models...</div>
+
+    <div class="config-section">
+      <h3>📋 Person Names Configuration</h3>
+      <textarea id="personsConfig" placeholder='["John", "Sarah", "Mike"]'>["person1", "person2", "person3"]</textarea>
+      <div class="help">
+        Enter person folder names as a JSON array. Example: ["Alice", "Bob", "Charlie"]<br>
+        These should match your folder names in the /database/ directory.
+      </div>
+    </div>
 
     <div class="camera-select">
       <label for="cameraSelect">📷 Select Camera:</label>
@@ -61,9 +80,9 @@
     </div>
 
     <div class="controls">
+      <button id="loadDataBtn">Load Database</button>
       <button id="startBtn" disabled>Start Camera</button>
       <button id="stopBtn" disabled>Stop Camera</button>
-      <button id="reloadBtn">Reload Database</button>
     </div>
 
     <div class="video-container" style="margin-top:16px;">
@@ -76,7 +95,6 @@
     <div id="personsLoaded" class="persons-loaded" style="display:none;">
       <h3>👥 Loaded Persons:</h3>
       <div id="personsList"></div>
-      <div class="small" style="margin-top:8px;">(Names discovered from <code>/database/</code> directory listing.)</div>
     </div>
   </div>
 
@@ -89,7 +107,23 @@
     let currentStream = null;
     let detectionRaf = null;
     let lastDetectionTime = 0;
-    const DETECTION_THROTTLE_MS = 100; // min time between detections
+    const DETECTION_THROTTLE_MS = 100;
+
+    // Wait for face-api to load
+    function waitForFaceApi() {
+      return new Promise((resolve) => {
+        if (typeof faceapi !== 'undefined') {
+          resolve();
+        } else {
+          const checkInterval = setInterval(() => {
+            if (typeof faceapi !== 'undefined') {
+              clearInterval(checkInterval);
+              resolve();
+            }
+          }, 100);
+        }
+      });
+    }
 
     // On load
     window.addEventListener('load', async () => {
@@ -97,21 +131,17 @@
       canvas = document.getElementById('canvas');
       ctx = canvas.getContext('2d');
 
-      // wire up buttons
+      // Wait for face-api library to load
+      await waitForFaceApi();
+
+      // Wire up buttons
+      document.getElementById('loadDataBtn').addEventListener('click', loadTrainingData);
       document.getElementById('startBtn').addEventListener('click', startVideo);
       document.getElementById('stopBtn').addEventListener('click', stopVideo);
-      document.getElementById('reloadBtn').addEventListener('click', async () => {
-        document.getElementById('reloadBtn').disabled = true;
-        document.getElementById('reloadBtn').textContent = 'Reloading...';
-        await loadTrainingData();
-        document.getElementById('reloadBtn').disabled = false;
-        document.getElementById('reloadBtn').textContent = 'Reload Database';
-      });
 
       await loadModels();
-      await warmupCameraPermission(); // so enumerateDevices returns labels
+      await warmupCameraPermission();
       await loadCameras();
-      await loadTrainingData();
     });
 
     // Load face-api models
@@ -123,7 +153,7 @@
         await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
         await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
         await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
-        status.textContent = '✅ Models loaded successfully!';
+        status.textContent = '✅ Models loaded! Configure person names and click "Load Database"';
         status.className = 'status ready';
       } catch (e) {
         status.textContent = '❌ Error loading models: ' + (e.message || e);
@@ -138,7 +168,6 @@
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
         stream.getTracks().forEach(t => t.stop());
       } catch (e) {
-        // user may deny — that's fine, device labels will be generic
         console.warn('camera warmup failed:', e);
       }
     }
@@ -178,73 +207,45 @@
       }
     }
 
-    // Scan database folders from directory listing
-    async function scanDatabaseFolders() {
-      const baseUrl = 'database/';
-      try {
-        const resp = await fetch(baseUrl, { method: 'GET' });
-        if (resp.ok) {
-          const ct = (resp.headers.get('content-type') || '').toLowerCase();
-          if (ct.includes('text/html')) {
-            const html = await resp.text();
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(html, 'text/html');
-            const anchors = Array.from(doc.querySelectorAll('a[href]'));
-            const folders = anchors
-              .map(a => a.getAttribute('href'))
-              .filter(href => href && href !== '../')
-              .map(h => {
-                // normalize: may be 'person1/' or './person1/' or full path
-                let v = h.replace(/^\.\//,'').replace(/\/$/,'');
-                // strip query or hash if present
-                v = v.split('?')[0].split('#')[0];
-                return v;
-              })
-              .filter((v,i,a) => v && a.indexOf(v) === i)
-              .filter(v => {
-                // Heuristic: ignore items that look like files (contain a dot)
-                return !v.includes('.');
-              });
-
-            if (folders.length > 0) {
-              console.log('Discovered folders from directory listing:', folders);
-              return folders;
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('Directory listing parse failed (or not provided):', e);
-      }
-
-      // No fallback - return empty array
-      console.warn('No directory listing available. Please ensure your server provides directory listing for /database/');
-      return [];
-    }
-
-    // Load training images from discovered folders
+    // Load training images from configured persons
     async function loadTrainingData() {
       const status = document.getElementById('status');
+      const loadBtn = document.getElementById('loadDataBtn');
+      
       try {
-        status.textContent = 'Scanning database for persons...';
-        status.className = 'status loading';
-        labeledDescriptors = [];
-
-        const persons = await scanDatabaseFolders();
-
-        if (!persons || persons.length === 0) {
-          status.textContent = '⚠️ No persons found. Ensure server has directory listing enabled for /database/';
+        // Parse person names from config
+        const configText = document.getElementById('personsConfig').value.trim();
+        let persons;
+        
+        try {
+          persons = JSON.parse(configText);
+          if (!Array.isArray(persons)) {
+            throw new Error('Configuration must be a JSON array');
+          }
+        } catch (e) {
+          status.textContent = '❌ Invalid JSON format in person names configuration';
           status.className = 'status error';
-          document.getElementById('startBtn').disabled = true;
           return;
         }
 
-        status.textContent = `Found ${persons.length} persons. Loading images...`;
+        if (persons.length === 0) {
+          status.textContent = '⚠️ No person names configured';
+          status.className = 'status error';
+          return;
+        }
+
+        loadBtn.disabled = true;
+        loadBtn.textContent = 'Loading...';
+        status.textContent = `Loading images for ${persons.length} persons...`;
+        status.className = 'status loading';
+        labeledDescriptors = [];
 
         for (const person of persons) {
           const descriptors = [];
           const extensions = ['jpg','jpeg','png'];
-          // try up to 20 images per folder
-          for (let i=1;i<=20;i++){
+          
+          // Try up to 20 images per folder
+          for (let i=1; i<=20; i++) {
             let got = false;
             for (const ext of extensions) {
               const imageUrl = `database/${person}/image${i}.${ext}`;
@@ -258,35 +259,38 @@
                   break;
                 }
               } catch (e) {
-                // image may not exist; try next extension
+                // Image may not exist; try next extension
               }
             }
-            // stop if no image found for this i (and i>1)
+            // Stop if no image found for this i (and i>1)
             if (!got && i>1) break;
           }
+          
           if (descriptors.length > 0) {
             labeledDescriptors.push(new faceapi.LabeledFaceDescriptors(person, descriptors));
           }
         }
 
         if (labeledDescriptors.length === 0) {
-          status.textContent = '⚠️ No valid training images found.';
+          status.textContent = '⚠️ No valid training images found. Check folder structure.';
           status.className = 'status error';
           document.getElementById('startBtn').disabled = true;
-          return;
+        } else {
+          // Create faceMatcher once
+          faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
+          displayLoadedPersons();
+
+          status.textContent = `✅ Loaded ${labeledDescriptors.length} persons. Select camera and start!`;
+          status.className = 'status ready';
+          document.getElementById('startBtn').disabled = false;
         }
-
-        // create faceMatcher once
-        faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
-        displayLoadedPersons();
-
-        status.textContent = `✅ Loaded ${labeledDescriptors.length} persons. Select camera and start!`;
-        status.className = 'status ready';
-        document.getElementById('startBtn').disabled = false;
       } catch (e) {
         console.error('Error loading training data:', e);
         status.textContent = '❌ Error loading training data: ' + (e.message || e);
         status.className = 'status error';
+      } finally {
+        loadBtn.disabled = false;
+        loadBtn.textContent = 'Load Database';
       }
     }
 
@@ -361,7 +365,7 @@
       document.getElementById('result').textContent = 'Camera stopped.';
     }
 
-    // main loop using requestAnimationFrame and throttling
+    // Main loop using requestAnimationFrame and throttling
     async function detectionLoop() {
       detectionRaf = requestAnimationFrame(detectionLoop);
       if (!isVideoRunning || !faceMatcher) return;
@@ -372,7 +376,6 @@
 
       try {
         const detections = await faceapi.detectAllFaces(video).withFaceLandmarks().withFaceDescriptors();
-        // resize results to displayed size
         const displaySize = { width: video.videoWidth, height: video.videoHeight };
         const resized = faceapi.resizeResults(detections, displaySize);
 
@@ -383,16 +386,16 @@
           resized.forEach((detection, i) => {
             const box = detection.detection.box;
             const match = results[i];
-            // draw box
+            // Draw box
             ctx.lineWidth = 3;
             ctx.strokeStyle = '#00ff00';
             ctx.strokeRect(box.x, box.y, box.width, box.height);
-            // label background
+            // Label background
             const text = match.toString();
             const th = 22;
             ctx.fillStyle = 'rgba(0,255,0,0.85)';
             ctx.fillRect(box.x, Math.max(0, box.y - th), box.width, th);
-            // label text
+            // Label text
             ctx.fillStyle = '#000';
             ctx.font = '18px Arial';
             ctx.fillText(text, box.x + 6, Math.max(14, box.y - 6));
@@ -427,7 +430,7 @@
       }
     });
 
-    // Resize canvas if window resized (keeps alignment)
+    // Resize canvas if window resized
     window.addEventListener('resize', () => {
       if (video && video.videoWidth) {
         canvas.width = video.videoWidth;
