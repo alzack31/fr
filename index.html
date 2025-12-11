@@ -149,10 +149,22 @@
       const status = document.getElementById('status');
       try {
         status.textContent = 'Loading face detection models...';
-        const MODEL_URL = 'https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/weights';
-        await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
-        await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
-        await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+        const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
+        
+        // Try primary CDN first
+        try {
+          await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+          await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+          await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+        } catch (e) {
+          // Fallback to alternative CDN
+          status.textContent = 'Trying alternative model source...';
+          const FALLBACK_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
+          await faceapi.nets.ssdMobilenetv1.loadFromUri(FALLBACK_URL);
+          await faceapi.nets.faceLandmark68Net.loadFromUri(FALLBACK_URL);
+          await faceapi.nets.faceRecognitionNet.loadFromUri(FALLBACK_URL);
+        }
+        
         status.textContent = '✅ Models loaded! Configure person names and click "Load Database"';
         status.className = 'status ready';
       } catch (e) {
